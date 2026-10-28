@@ -125,13 +125,13 @@ def r_capture(d):
     if name not in bot.TEMPLATES or SNAP["img"] is None:
         return {"ok": False, "error": "take a screenshot first"}
     x1, y1, x2, y2 = (int(d[k]) for k in ("x1", "y1", "x2", "y2"))
-    h, w = SNAP["img"].shape[:2]
+    w, h = SNAP["img"].size
     x1, x2 = sorted((max(0, x1), min(w, x2)))
     y1, y2 = sorted((max(0, y1), min(h, y2)))
     if x2 - x1 < 5 or y2 - y1 < 5:
         return {"ok": False, "error": "box too small"}
     os.makedirs(bot.IMG_DIR, exist_ok=True)
-    bot.cv2.imwrite(f"{bot.IMG_DIR}/{name}.png", SNAP["img"][y1:y2, x1:x2])
+    SNAP["img"].crop((x1, y1, x2, y2)).save(f"{bot.IMG_DIR}/{name}.png")
     SNAP.update(ready=False, msg=f"OK captured {name}.png")
     return {"ok": True}
 
@@ -285,8 +285,9 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/snap.png":
             if SNAP["img"] is None:
                 return self._send(404, {"error": "no screenshot"})
-            ok, buf = bot.cv2.imencode(".png", SNAP["img"])
-            return self._send(200, buf.tobytes(), "image/png")
+            buf = bot.BytesIO()
+            SNAP["img"].save(buf, "PNG")
+            return self._send(200, buf.getvalue(), "image/png")
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
