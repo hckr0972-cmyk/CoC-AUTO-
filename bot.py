@@ -26,9 +26,10 @@ import sys
 import threading
 import time
 from collections import deque
+from io import BytesIO
 
-import cv2
 import numpy as np
+from PIL import Image
 
 CFG_FILE = "config.json"
 IMG_DIR = "img"
@@ -197,30 +198,71 @@ def swipe(a, b, ms=700):
 # --------------------------------------------------------------------------
 
 def shot():
+    """Current screen as a PIL RGB image."""
     data = adb("exec-out", "screencap", "-p")
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
-    if img is None:
+    try:
+        return Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
         raise BotError("Cannot read the screen. Is adb connected? (adb connect localhost:PORT)")
-    return img
 
 
 def has_template(name):
     return os.path.isfile(f"{IMG_DIR}/{name}.png")
 
 
+DOWNSCALE = 2  # match on a half-size picture: ~4x faster, accurate enough for taps
+
+
+def _prep(img):
+    g = np.asarray(img.convert("L"), dtype=np.float32)
+    f = DOWNSCALE
+    if f > 1:
+        h, w = (g.shape[0] // f) * f, (g.shape[1] // f) * f
+        g = g[:h, :w].reshape(h // f, f, w // f, f).mean(axis=(1, 3))
+    return g
+
+
+def ncc(scr, tpl):
+    """Normalized cross-correlation (same score as OpenCV TM_CCOEFF_NORMED).
+    Returns (best_score, x, y) of the best top-left position."""
+    H, W = scr.shape
+    h, w = tpl.shape
+    if h > H or w > W or h < 2 or w < 2:
+        return 0.0, 0, 0
+    t0 = tpl - tpl.mean()
+    tden = float(np.sqrt((t0 * t0).sum()))
+    if tden < 1e-6:  # flat template, nothing to match
+        return 0.0, 0, 0
+    n = h * w
+    F = np.fft.rfft2(scr)
+    G = np.fft.rfft2(t0, s=scr.shape)
+    num = np.fft.irfft2(F * np.conj(G), s=scr.shape)[:H - h + 1, :W - w + 1]
+
+    def box(a):  # sum of every h x w window (integral image)
+        c = np.cumsum(np.cumsum(a, axis=0, dtype=np.float64), axis=1, dtype=np.float64)
+        c = np.pad(c, ((1, 0), (1, 0)))
+        return c[h:, w:] - c[:-h, w:] - c[h:, :-w] + c[:-h, :-w]
+
+    s1, s2 = box(scr), box(scr * scr)
+    den = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0)) * tden
+    r = np.where(den > 1e-3, num / np.maximum(den, 1e-9), 0.0)
+    iy, ix = np.unravel_index(np.argmax(r), r.shape)
+    return float(r[iy, ix]), int(ix), int(iy)
+
+
 def best_match(name, scr=None):
     """Return (center or None, confidence, threshold)."""
     thr = TEMPLATES[name][1]
-    tpl = cv2.imread(f"{IMG_DIR}/{name}.png", cv2.IMREAD_GRAYSCALE)
-    if tpl is None:
+    path = f"{IMG_DIR}/{name}.png"
+    if not os.path.isfile(path):
         raise BotError(f"template '{name}' not captured yet")
     if scr is None:
         scr = shot()
-    gray = cv2.cvtColor(scr, cv2.COLOR_BGR2GRAY)
-    res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
-    _, mx, _, loc = cv2.minMaxLoc(res)
-    center = (loc[0] + tpl.shape[1] // 2, loc[1] + tpl.shape[0] // 2) if mx >= thr else None
-    return center, float(mx), thr
+    tpl = _prep(Image.open(path))
+    score, x, y = ncc(_prep(scr), tpl)
+    f = DOWNSCALE
+    center = ((x + tpl.shape[1] // 2) * f, (y + tpl.shape[0] // 2) * f) if score >= thr else None
+    return center, score, thr
 
 
 def find(name):
@@ -488,7 +530,7 @@ def touch_info():
     d = adb("shell", "dumpsys", "input").decode(errors="ignore")
     m = re.search(r"SurfaceOrientation:\s*(\d)", d)
     rot = int(m.group(1)) if m else 1
-    h, w = shot().shape[:2]
+    w, h = shot().size
     return int(mx.group(1)), int(my.group(1)), rot, min(w, h), max(w, h)
 
 
@@ -574,11 +616,11 @@ def main():
         if p:
             tap(p, jitter=0)
     elif cmd == "shot":
-        cv2.imwrite("screen.png", shot())
+        shot().save("screen.png")
         print("saved screen.png")
     elif cmd == "capture" and len(args) == 5 and args[0] in TEMPLATES:
         x1, y1, x2, y2 = map(int, args[1:5])
-        cv2.imwrite(f"{IMG_DIR}/{args[0]}.png", shot()[y1:y2, x1:x2])
+        shot().crop((x1, y1, x2, y2)).save(f"{IMG_DIR}/{args[0]}.png")
         print(f"saved {IMG_DIR}/{args[0]}.png")
     elif cmd == "test":
         for n in TEMPLATES:
